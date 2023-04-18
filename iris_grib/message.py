@@ -8,12 +8,16 @@ Defines a lightweight wrapper class to wrap a single GRIB message.
 
 """
 
-from collections import namedtuple
 import re
+from typing import Iterable, Optional, Tuple
 
 import eccodes
+import fsspec
+from fsspec import AbstractFileSystem
+from fsspec.spec import AbstractBufferedFile
 import numpy as np
 import numpy.ma as ma
+from s3fs import S3FileSystem
 
 from iris._lazy_data import as_lazy_data
 from iris.exceptions import TranslationError
@@ -42,37 +46,67 @@ class GribMessage:
 
     """
 
-    @staticmethod
-    def messages_from_filename(filename):
+    @classmethod
+    def messages_from_file(
+        cls,
+        file_path,
+        fs: Optional[AbstractFileSystem] = None,
+        index: Optional[Iterable[Tuple[int, int]]] = None
+    ) -> Iterable["GribMessage"]:
         """
         Return a generator of :class:`GribMessage` instances; one for
         each message in the supplied GRIB file.
 
         Args:
 
-        * filename (string):
-            Name of the file to generate fields from.
+        * file_path (string):
+            File system path of the file to generate fields from.
+        * fs (AbstractFileSystem):
+            An optional fsspec file system to use to open the file.
+        * index ():
+            An optional index of (offset, size_in_bytes) tuples identifying
+            the positions of messages within the file. This is required for
+            reading from S3 as S3FS does not support certain file operations
+            required by eccodes when scanning a file (e.g. `.fileno()`). It
+            can also be used to read a subset of messages from a large file.
 
         """
-        grib_fh = open(filename, 'rb')
+        if file_path.startswith("s3://"):
+            if not fs:
+                fs = S3FileSystem()
+            file_path = file_path.replace("s3://", "")
+        elif not fs:
+            fs = fsspec.filesystem("file")
+
+        grib_fh = fs.open(file_path, 'rb')
         # create an _OpenFileRef to manage the closure of the file handle
         file_ref = _OpenFileRef(grib_fh)
 
-        while True:
-            offset = grib_fh.tell()
-            grib_id = eccodes.codes_new_from_file(
-                grib_fh, eccodes.CODES_PRODUCT_GRIB
-            )
-            if grib_id is None:
-                break
-            raw_message = _RawGribMessage(grib_id)
-            recreate_raw = _MessageLocation(filename, offset)
-            yield GribMessage(raw_message, recreate_raw, file_ref=file_ref)
+        if index:
+            for offset, length in index:
+                raw_message = _RawGribMessage.from_file_offset(file_path, offset, length, fs=fs, fh=grib_fh)
+                recreate_raw = _MessageLocation(file_path, offset, length=length, fs=fs, fh=grib_fh)
+                yield cls(raw_message, recreate_raw, file_ref=file_ref)
+        else:
+            while True:
+                offset = grib_fh.tell()
+                grib_id = eccodes.codes_new_from_file(
+                    grib_fh, eccodes.CODES_PRODUCT_GRIB
+                )
+                if grib_id is None:
+                    break
+                try:
+                    length = eccodes.codes_get(grib_id, "totalLength", int)
+                except eccodes.CodesInternalError:
+                    length = None
+                raw_message = _RawGribMessage(grib_id)
+                recreate_raw = _MessageLocation(file_path, offset, length=length, fs=fs, fh=grib_fh)
+                yield cls(raw_message, recreate_raw, file_ref=file_ref)
 
     def __init__(self, raw_message, recreate_raw, file_ref=None):
         """
         It is recommended to obtain GribMessage instance from the static method
-        :meth:`~GribMessage.messages_from_filename`, rather than creating
+        :meth:`~GribMessage.messages_from_file`, rather than creating
         them directly.
 
         """
@@ -169,13 +203,27 @@ class GribMessage:
         return self
 
 
-class _MessageLocation(namedtuple('_MessageLocation', 'filename offset')):
+class _MessageLocation:
     """A reference to a specific GRIB message within a file."""
 
-    __slots__ = ()
+    __slots__ = ("filename", "offset", "length", "fs", "fh")
+
+    def __init__(
+        self,
+        filename,
+        offset,
+        length: Optional[int] = None,
+        fs: Optional[AbstractFileSystem] = None,
+        fh: Optional[AbstractBufferedFile] = None,
+    ):
+        self.filename = filename
+        self.offset = offset
+        self.length = length
+        self.fs = fs
+        self.fh = fh
 
     def __call__(self):
-        return _RawGribMessage.from_file_offset(self.filename, self.offset)
+        return _RawGribMessage.from_file_offset(self.filename, self.offset, length=self.length, fs=self.fs, fh=self.fh)
 
 
 class _DataProxy:
@@ -281,15 +329,38 @@ class _RawGribMessage:
     _NEW_SECTION_KEY_MATCHER = re.compile(r'section([0-9]{1})Length')
 
     @staticmethod
-    def from_file_offset(filename, offset):
-        with open(filename, 'rb') as f:
-            f.seek(offset)
-            message_id = eccodes.codes_new_from_file(
-                f, eccodes.CODES_PRODUCT_GRIB
-            )
-            if message_id is None:
-                fmt = 'Invalid GRIB message: {} @ {}'
-                raise RuntimeError(fmt.format(filename, offset))
+    def from_file_offset(
+        file_path,
+        offset,
+        length: Optional[int] = None,
+        fs: Optional[AbstractFileSystem] = None,
+        fh: Optional[AbstractBufferedFile] = None,
+    ):
+        if file_path.startswith("s3://"):
+            if not fs:
+                fs = S3FileSystem()
+            file_path = file_path.replace("s3://", "")
+        elif not fs:
+            fs = fsspec.filesystem("file")
+
+        if length is not None:
+            if fh is not None and not fh.closed:
+                fh.seek(offset)
+                message_bytes = fh.read(length)
+            else:
+                message_bytes = fs.read_block(file_path, offset, length)
+            message_id = eccodes.codes_new_from_message(message_bytes)
+        else:
+            with fs.open(file_path, 'rb') as f:
+                f.seek(offset)
+                message_id = eccodes.codes_new_from_file(
+                    f, eccodes.CODES_PRODUCT_GRIB
+                )
+
+        if message_id is None:
+            fmt = 'Invalid GRIB message: {} @ {}'
+            raise RuntimeError(fmt.format(file_path, offset))
+
         return _RawGribMessage(message_id)
 
     def __init__(self, message_id):

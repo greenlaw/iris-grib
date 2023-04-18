@@ -12,10 +12,12 @@ See: `ECMWF GRIB API <https://software.ecmwf.int/wiki/display/GRIB/Home>`_.
 
 import datetime
 import math  # for fmod
+from typing import Iterable, Optional, Tuple
 
 import cartopy.crs as ccrs
 import cf_units
 import eccodes
+from fsspec import AbstractFileSystem
 import numpy as np
 import numpy.ma as ma
 
@@ -31,7 +33,7 @@ from ._load_convert import convert as load_convert
 from .message import GribMessage
 
 
-__version__ = '0.19.dev0'
+__version__ = '0.20.0'
 
 __all__ = ['load_cubes', 'save_grib2', 'load_pairs_from_fields',
            'save_pairs_from_cube', 'save_messages']
@@ -657,29 +659,42 @@ def _message_values(grib_message, shape):
     return data
 
 
-def _load_generate(filename):
-    messages = GribMessage.messages_from_filename(filename)
-    for message in messages:
-        editionNumber = message.sections[0]['editionNumber']
-        if editionNumber == 1:
-            message_id = message._raw_message._message_id
-            grib_fh = message._file_ref.open_file
-            message = GribWrapper(message_id, grib_fh=grib_fh)
-        elif editionNumber != 2:
-            emsg = 'GRIB edition {} is not supported by {!r}.'
-            raise TranslationError(emsg.format(editionNumber,
-                                               type(message).__name__))
-        yield message
+def _load_generate_factory(
+    fs: Optional[AbstractFileSystem] = None,
+    index: Optional[Iterable[Tuple[int, int]]] = None,
+):
+    def _load_generate(path):
+        messages = GribMessage.messages_from_file(path, fs=fs, index=index)
+        for message in messages:
+            editionNumber = message.sections[0]['editionNumber']
+            if editionNumber == 1:
+                # TODO: Add fsspec support to GRIB1 handling
+                message_id = message._raw_message._message_id
+                grib_fh = message._file_ref.open_file
+                message = GribWrapper(message_id, grib_fh=grib_fh)
+            elif editionNumber != 2:
+                emsg = 'GRIB edition {} is not supported by {!r}.'
+                raise TranslationError(emsg.format(editionNumber,
+                                                type(message).__name__))
+            yield message
+
+    return _load_generate
 
 
-def load_cubes(filenames, callback=None):
+def load_cubes(
+    paths,
+    callback=None,
+    fs: Optional[AbstractFileSystem] = None,
+    index: Optional[Iterable[Tuple[int, int]]] = None,
+):
     """
-    Returns a generator of cubes from the given list of filenames.
+    Returns a generator of cubes from the given list of paths/URIs.
 
     Args:
 
-    * filenames:
-        One or more GRIB filenames to load from.
+    * paths:
+        One or more GRIB file paths or S3 URIs (of the form `s3://bucket/key`)
+        to load from.
 
     Kwargs:
 
@@ -691,10 +706,10 @@ def load_cubes(filenames, callback=None):
 
     """
     import iris.fileformats.rules as iris_rules
-    grib_loader = iris_rules.Loader(_load_generate,
+    grib_loader = iris_rules.Loader(_load_generate_factory(fs=fs, index=index),
                                     {},
                                     load_convert)
-    return iris_rules.load_cubes(filenames, callback, grib_loader)
+    return iris_rules.load_cubes(paths, callback, grib_loader)
 
 
 def load_pairs_from_fields(grib_messages):
@@ -713,7 +728,7 @@ def load_pairs_from_fields(grib_messages):
         >>> from iris_grib.message import GribMessage
         >>> filename = iris.sample_data_path('polar_stereo.grib2')
         >>> filtered_messages = []
-        >>> for message in GribMessage.messages_from_filename(filename):
+        >>> for message in GribMessage.messages_from_file(filename):
         ...     if message.sections[1]['productionStatusOfProcessedData'] == 0:
         ...         filtered_messages.append(message)
         >>> cubes_messages = load_pairs_from_fields(filtered_messages)
@@ -728,7 +743,7 @@ def load_pairs_from_fields(grib_messages):
     be cleaned up this way and cubes created:
 
         >>> from iris_grib import load_pairs_from_fields
-        >>> cleaned_messages = GribMessage.messages_from_filename(filename)
+        >>> cleaned_messages = GribMessage.messages_from_file(filename)
         >>> for message in cleaned_messages:
         ...     if message.sections[1]['productionStatusOfProcessedData'] == 0:
         ...         message.sections[1]['productionStatusOfProcessedData'] = 4
